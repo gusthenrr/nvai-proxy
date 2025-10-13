@@ -1,7 +1,7 @@
 # server_proxy.py
 from flask import Flask, request, Response, jsonify
 from flask_cors import CORS
-import os, itertools, requests, re
+import os, itertools, requests, re, time, random
 from urllib.parse import urlparse, unquote
 from urllib3.util.retry import Retry
 from requests.adapters import HTTPAdapter
@@ -18,15 +18,19 @@ SP_USERNAME = os.getenv("SP_USERNAME", "").strip()
 SP_PASSWORD = os.getenv("SP_PASSWORD", "").strip()
 
 _raw_eps = (os.getenv("SP_ENDPOINTS") or os.getenv("SP_ENDPOINT") or "")
-# aceita vírgula, espaço e quebras de linha
-ENDPOINTS = [e.strip() for e in re.split(r"[,\s]+", _raw_eps) if e.strip()]
+ENDPOINTS = [e.strip() for e in re.split(r"[,\s]+", _raw_eps) if e.strip()]   # aceita vírgula/esp/linhas
 
 CONNECT_TO = float(os.getenv("SP_CONNECT_TIMEOUT", "4"))
 READ_TO    = float(os.getenv("SP_READ_TIMEOUT", "6"))
 POOL_CONN  = int(os.getenv("SP_POOL_CONNECTIONS", "100"))
 POOL_MAX   = int(os.getenv("SP_POOL_MAXSIZE", "200"))
 DEBUG      = os.getenv("SP_DEBUG", "0") == "1"
-SP_REFERER = os.getenv("SP_REFERER", "").strip()  # opcional: ex. https://www.mercadolivre.com.br/
+SP_REFERER = os.getenv("SP_REFERER", "").strip()  # ex.: https://www.mercadolivre.com.br/
+
+# === novo: retry só quando detectar gate ===
+SP_GATE_RETRY = os.getenv("SP_GATE_RETRY", "1") == "1"  # ativa/desativa retry anti-gate
+JIT_MIN = float(os.getenv("SP_JITTER_MIN", "0.10"))
+JIT_MAX = float(os.getenv("SP_JITTER_MAX", "0.25"))
 
 # ===== sessão HTTP =====
 session = requests.Session()
@@ -43,11 +47,7 @@ session.trust_env = False
 # round-robin de portas (ou única porta)
 _cycle = itertools.cycle(ENDPOINTS) if ENDPOINTS else None
 def pick_proxies():
-    ep = None
-    if _cycle:
-        ep = next(_cycle)
-    elif _raw_eps.strip():
-        ep = _raw_eps.strip()
+    ep = next(_cycle) if _cycle else (_raw_eps.strip() or None)
     if not ep:
         return None, None
     proxies = {
@@ -65,11 +65,11 @@ DEFAULT_OUT_HEADERS = {
     "Accept-Encoding": "gzip, deflate",      # sem 'br' p/ evitar dependência
     "Connection": "keep-alive",
     "Upgrade-Insecure-Requests": "1",
-    # client hints + sec-fetch (ajuda em “catalog”)
+    # ajuste mínimo aqui: cross-site é o que seu fetch realmente é
     "sec-ch-ua": '"Chromium";v="120", "Google Chrome";v="120", "Not A(Brand";v="24"',
     "sec-ch-ua-platform": '"Windows"',
     "sec-ch-ua-mobile": "?0",
-    "sec-fetch-site": "none",                # muda p/ same-origin se usar SP_REFERER
+    "sec-fetch-site": "cross-site",
     "sec-fetch-mode": "navigate",
     "sec-fetch-user": "?1",
     "sec-fetch-dest": "document",
@@ -101,7 +101,7 @@ def add_cors(resp: Response):
     )
     resp.headers["Access-Control-Expose-Headers"] = (
         "Content-Type, ETag, Cache-Control, Last-Modified, Location, Content-Range, "
-        "Content-Length, X-Proxy-Final-Url, X-Proxy-Redirect-Count, X-Proxy-Endpoint, X-Proxy-Error"
+        "Content-Length, X-Proxy-Final-Url, X-Proxy-Redirect-Count, X-Proxy-Endpoint, X-Proxy-Error, X-Proxy-Gate-Retry"
     )
     resp.headers["Access-Control-Max-Age"] = "86400"
     resp.headers["Vary"] = "Origin, Access-Control-Request-Headers, Access-Control-Request-Method"
@@ -138,21 +138,16 @@ def _proxy_check():
 
 @app.route("/_diag_endpoints", methods=["GET"])
 def _diag_endpoints():
-    """Testa todas as portas rapidamente e mostra quais falham (pega só status/IP)."""
     out = []
     for ep in ENDPOINTS or ([_raw_eps.strip()] if _raw_eps.strip() else []):
-        proxies = {
-            "http":  f"http://{SP_USERNAME}:{SP_PASSWORD}@{ep}",
-            "https": f"http://{SP_USERNAME}:{SP_PASSWORD}@{ep}",
-        }
+        proxies = {"http": f"http://{SP_USERNAME}:{SP_PASSWORD}@{ep}",
+                   "https": f"http://{SP_USERNAME}:{SP_PASSWORD}@{ep}"}
         item = {"endpoint": ep}
         try:
             rr = session.get("https://ip.decodo.com/json", timeout=(2.5, 4.0), proxies=proxies)
-            item["ok"] = True
-            item["status"] = rr.status_code
+            item["ok"] = True; item["status"] = rr.status_code
         except Exception as e:
-            item["ok"] = False
-            item["error"] = str(e)
+            item["ok"] = False; item["error"] = str(e)
         out.append(item)
     return jsonify(out), 200
 
@@ -170,14 +165,15 @@ def proxy(raw: str):
     if not is_allowed(target):
         return add_cors(Response("Host não permitido", status=400))
 
-    # nunca repassar Cookie; prioriza UA do cliente se vier
     forward_headers = dict(DEFAULT_OUT_HEADERS)
     for k in ("Authorization","Content-Type","Accept","Accept-Language",
               "User-Agent","Range","If-None-Match","If-Modified-Since"):
         v = request.headers.get(k)
         if v: forward_headers[k] = v
 
-    ep, proxies = pick_proxies()
+    # 1ª tentativa
+    ep1, proxies1 = pick_proxies()
+    gate_retry = False
     try:
         r = session.request(
             method=request.method,
@@ -187,17 +183,41 @@ def proxy(raw: str):
             timeout=(CONNECT_TO, READ_TO),
             stream=False,
             verify=True,
-            proxies=proxies,
+            proxies=proxies1,
         )
     except requests.RequestException as e:
-        # retorno 502 com detalhes – facilita achar porta/erro ruim
-        body = jsonify({"error": str(e), "endpoint": ep or ""})
+        body = jsonify({"error": str(e), "endpoint": ep1 or ""})
         resp = Response(body.get_data(as_text=True), status=502, mimetype="application/json")
-        if ep: resp.headers["X-Proxy-Endpoint"] = ep
+        if ep1: resp.headers["X-Proxy-Endpoint"] = ep1
         resp.headers["X-Proxy-Error"] = str(e)
         return add_cors(resp)
 
-    # sucesso (mesmo que 302/304/etc – a extensão sabe lidar)
+    # retry mínimo só se detectar gate
+    if SP_GATE_RETRY and looks_like_gate(r):
+        gate_retry = True
+        ep2, proxies2 = pick_proxies()  # próxima porta do pool
+        time.sleep(random.uniform(JIT_MIN, JIT_MAX))
+        try:
+            r = session.request(
+                method=request.method,
+                url=target,
+                headers=forward_headers,
+                allow_redirects=True,
+                timeout=(CONNECT_TO, READ_TO),
+                stream=False,
+                verify=True,
+                proxies=proxies2,
+            )
+            if ep2: ep1 = ep2  # reportar a porta final que respondeu
+        except requests.RequestException as e:
+            body = jsonify({"error": str(e), "endpoint": ep2 or ep1 or ""})
+            resp = Response(body.get_data(as_text=True), status=502, mimetype="application/json")
+            if ep2 or ep1: resp.headers["X-Proxy-Endpoint"] = (ep2 or ep1)
+            resp.headers["X-Proxy-Error"] = str(e)
+            resp.headers["X-Proxy-Gate-Retry"] = "1"
+            return add_cors(resp)
+
+    # sucesso (mesmo que 302/304/etc)
     resp = Response(r.content if request.method == "GET" else b"", status=r.status_code)
     hop_by_hop = {"transfer-encoding","connection","keep-alive","proxy-authenticate",
                   "proxy-authorization","te","trailers","upgrade"}
@@ -209,7 +229,8 @@ def proxy(raw: str):
             resp.headers[k] = v
     resp.headers["X-Proxy-Final-Url"] = getattr(r, "url", target)
     resp.headers["X-Proxy-Redirect-Count"] = str(len(getattr(r, "history", [])))
-    if ep: resp.headers["X-Proxy-Endpoint"] = ep
+    if ep1: resp.headers["X-Proxy-Endpoint"] = ep1
+    if gate_retry: resp.headers["X-Proxy-Gate-Retry"] = "1"
     return add_cors(resp)
 
 if __name__ == "__main__":
