@@ -2,7 +2,7 @@
 from flask import Flask, request, Response
 from flask_cors import CORS
 import requests, os
-from urllib.parse import urlparse
+from urllib.parse import urlparse, unquote
 from urllib3.util.retry import Retry
 from requests.adapters import HTTPAdapter
 
@@ -15,15 +15,16 @@ ALLOWED_SUFFIXES = (".mercadolivre.com.br", ".mercadolibre.com")
 # ---------- Sessão HTTP com Retry + Proxy ----------
 session = requests.Session()
 retry = Retry(
-    total=3, backoff_factor=0.5,
+    total=3,
+    backoff_factor=0.5,
     status_forcelist=[429, 500, 502, 503, 504],
-    allowed_methods=["HEAD", "GET", "OPTIONS"]
+    allowed_methods=frozenset(["HEAD", "GET", "OPTIONS"])
 )
 adapter = HTTPAdapter(max_retries=retry, pool_connections=20, pool_maxsize=50)
 session.mount("https://", adapter)
 session.mount("http://", adapter)
 
-# Smartproxy (Decodo) via env
+# Smartproxy/Decodo via env
 SP_ENDPOINT = os.getenv("SP_ENDPOINT")      # ex.: br.decodo.com:10001 (sticky 10min)
 SP_USERNAME = os.getenv("SP_USERNAME")      # ex.: spv25y9c1j
 SP_PASSWORD = os.getenv("SP_PASSWORD")      # sua senha
@@ -37,7 +38,7 @@ DEFAULT_OUT_HEADERS = {
                    "(KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36"),
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
     "Accept-Language": "pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7",
-    # evita 'br' pra não precisar de brotli no servidor
+    # evita 'br' pra não depender de brotli no servidor
     "Accept-Encoding": "gzip, deflate",
     "Cache-Control": "no-cache",
     "Pragma": "no-cache",
@@ -79,13 +80,25 @@ def add_cors(resp: Response):
 def _opts(raw):
     return add_cors(Response(status=204))
 
-@app.route("/", defaults={"raw": ""}, methods=["GET"])
-@app.route("/<path:raw>", methods=["GET"])
+@app.route("/_health", methods=["GET"])
+def _health():
+    return "ok", 200
+
+@app.route("/_proxy_check", methods=["GET"])
+def _proxy_check():
+    r = session.get("https://ip.decodo.com/json", timeout=(8, 25))
+    return (r.text, 200, {"Content-Type": "application/json"})
+
+# Suporta GET e HEAD (casa com a extensão)
+@app.route("/", defaults={"raw": ""}, methods=["GET", "HEAD"])
+@app.route("/<path:raw>", methods=["GET", "HEAD"])
 def proxy(raw: str):
     if not raw:
-        return add_cors(Response("Target URL ausente", status=400))
+        # raiz sem alvo: responde 200 p/ health checks simples
+        return add_cors(Response("OK - use /https://<url-destino>", status=200))
 
-    target = raw
+    # O path já vem como "https://dominio/..." (sem URL-encode)
+    target = unquote(raw)
     q = request.query_string.decode("utf-8")
     if q:
         target = f"{target}{'&' if '?' in target else '?'}{q}"
@@ -93,28 +106,29 @@ def proxy(raw: str):
     if not is_allowed(target):
         return add_cors(Response("Host não permitido", status=400))
 
-    # NÃO forward de Cookie (evita conta real) — só cabeçalhos “seguros”
+    # NUNCA repassar Cookie/Referer (evita conta real e fingerprint do seu app)
     forward_headers = dict(DEFAULT_OUT_HEADERS)
     for k in ("Authorization","Content-Type","Accept","Accept-Language",
-              "User-Agent","Range","If-None-Match","If-Modified-Since","Referer"):
+              "User-Agent","Range","If-None-Match","If-Modified-Since"):
         v = request.headers.get(k)
         if v:
             forward_headers[k] = v
 
     try:
         r = session.request(
-            method="GET",
+            method=request.method,
             url=target,
             headers=forward_headers,
-            allow_redirects=True,
-            timeout=(10, 60),  # connect, read
+            allow_redirects=True,     # segue 301/302 como a extensão espera por padrão
+            timeout=(8, 25),          # curto o suficiente p/ não bater os 30s do SW
             stream=False,
             verify=True,
         )
     except requests.RequestException as e:
         return add_cors(Response(f"Erro ao contatar destino: {e}", status=502))
 
-    resp = Response(r.content, status=r.status_code)
+    # Monta resposta
+    resp = Response(r.content if request.method == "GET" else b"", status=r.status_code)
     hop_by_hop = {"transfer-encoding","connection","keep-alive","proxy-authenticate",
                   "proxy-authorization","te","trailers","upgrade"}
     for k, v in r.headers.items():
@@ -122,15 +136,9 @@ def proxy(raw: str):
         if lk in hop_by_hop:
             continue
         if lk in ("content-type","cache-control","etag","last-modified",
-                  "content-range","accept-ranges","location"):
+                  "content-range","accept-ranges","location","content-length"):
             resp.headers[k] = v
 
     resp.headers["X-Proxy-Final-Url"] = getattr(r, "url", target)
     resp.headers["X-Proxy-Redirect-Count"] = str(len(getattr(r, "history", [])))
     return add_cors(resp)
-
-@app.route("/_proxy_check", methods=["GET"])
-def _proxy_check():
-    r = session.get("https://ip.decodo.com/json", timeout=(8, 30))
-    return (r.text, 200, {"Content-Type": "application/json"})
-
