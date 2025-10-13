@@ -157,3 +157,7 @@ def proxy(raw: str):
     resp.headers["X-Proxy-Final-Url"] = getattr(r, "url", target)
     resp.headers["X-Proxy-Redirect-Count"] = str(len(getattr(r, "history", [])))
     return add_cors(resp)
+
+# Permite rodar sem Gunicorn (dev/backup)
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=int(os.getenv("PORT", "8080")))
