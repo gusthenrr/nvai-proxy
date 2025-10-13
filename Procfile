@@ -1,1 +1,1 @@
-web: cd nvai && gunicorn -k eventlet -w 1 -b 0.0.0.0:$PORT teste:app
+web: gunicorn -w 2 -k gthread -t 60 -b 0.0.0.0:$PORT server_proxy:app
