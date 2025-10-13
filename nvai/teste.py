@@ -1,8 +1,7 @@
 # server_proxy.py
 from flask import Flask, request, Response
 from flask_cors import CORS
-import os, time, random, itertools
-import requests
+import os, requests, itertools
 from urllib.parse import urlparse, unquote
 from urllib3.util.retry import Retry
 from requests.adapters import HTTPAdapter
@@ -10,7 +9,7 @@ from requests.adapters import HTTPAdapter
 app = Flask(__name__)
 CORS(app, supports_credentials=True)
 
-# Domínios permitidos (ML + API)
+# Destinos permitidos (ML + API)
 ALLOWED_EXACT = {"api.mercadolibre.com"}
 ALLOWED_SUFFIXES = (".mercadolivre.com.br", ".mercadolibre.com")
 
@@ -19,7 +18,7 @@ SP_USERNAME = os.getenv("SP_USERNAME", "")
 SP_PASSWORD = os.getenv("SP_PASSWORD", "")
 
 _raw_eps = (os.getenv("SP_ENDPOINTS") or os.getenv("SP_ENDPOINT") or "").replace("\n", "")
-ENDPOINTS = [e.strip() for e in _raw_eps.split(",") if e.strip()]
+ENDPOINTS = [e.strip() for e in _raw_eps.split(",") if e.strip()]  # aceita uma ou várias portas
 
 CONNECT_TO = float(os.getenv("SP_CONNECT_TIMEOUT", "4"))   # seg
 READ_TO    = float(os.getenv("SP_READ_TIMEOUT", "6"))      # seg
@@ -27,10 +26,10 @@ POOL_CONN  = int(os.getenv("SP_POOL_CONNECTIONS", "100"))
 POOL_MAX   = int(os.getenv("SP_POOL_MAXSIZE", "200"))
 DEBUG      = os.getenv("SP_DEBUG", "0") == "1"
 
-# ====== Session HTTP (rápida e estável) ======
+# ====== Session HTTP ======
 session = requests.Session()
 retry = Retry(
-    total=1,  # a gente controla retry se quiser; aqui é “rápido”
+    total=1,  # sem retries internos demorados
     backoff_factor=0.0,
     status_forcelist=[429, 500, 502, 503, 504],
     allowed_methods=frozenset(["HEAD", "GET", "OPTIONS"])
@@ -40,16 +39,17 @@ session.mount("https://", adapter)
 session.mount("http://", adapter)
 session.trust_env = False
 
-# Round-robin simples (ou porta única)
+# Round-robin (ou única porta)
 _cycle = itertools.cycle(ENDPOINTS) if ENDPOINTS else None
 def pick_proxies():
+    ep = None
     if _cycle:
         ep = next(_cycle)
-    else:
-        ep = _raw_eps.strip() if _raw_eps else ""
+    elif _raw_eps:
+        ep = _raw_eps.strip()  # uma única porta em SP_ENDPOINT
     if not ep:
-        return None  # sem proxy (desaconselhado, mas não quebra o app)
-    if DEBUG: print(f"[proxy] usando {ep}")
+        return None  # sem proxy: não recomendado, mas não quebra o app
+    if DEBUG: print(f"[proxy] {ep}")
     return {
         "http":  f"http://{SP_USERNAME}:{SP_PASSWORD}@{ep}",
         "https": f"http://{SP_USERNAME}:{SP_PASSWORD}@{ep}",
@@ -60,7 +60,7 @@ DEFAULT_OUT_HEADERS = {
                    "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"),
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
     "Accept-Language": "pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7",
-    "Accept-Encoding": "gzip, deflate",
+    "Accept-Encoding": "gzip, deflate",  # sem 'br' para simplificar
     "Connection": "keep-alive",
     "Upgrade-Insecure-Requests": "1",
 }
@@ -158,6 +158,5 @@ def proxy(raw: str):
     resp.headers["X-Proxy-Redirect-Count"] = str(len(getattr(r, "history", [])))
     return add_cors(resp)
 
-# Permite rodar sem Gunicorn (dev/backup)
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", "8080")))
