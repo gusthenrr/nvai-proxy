@@ -128,3 +128,9 @@ def proxy(raw: str):
     resp.headers["X-Proxy-Final-Url"] = getattr(r, "url", target)
     resp.headers["X-Proxy-Redirect-Count"] = str(len(getattr(r, "history", [])))
     return add_cors(resp)
+
+@app.route("/_proxy_check", methods=["GET"])
+def _proxy_check():
+    r = session.get("https://ip.decodo.com/json", timeout=(8, 30))
+    return (r.text, 200, {"Content-Type": "application/json"})
+
