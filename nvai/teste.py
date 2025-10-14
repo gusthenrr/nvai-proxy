@@ -140,11 +140,17 @@ def _health():
 
 @app.route("/_proxy_check", methods=["GET"])
 def _proxy_check():
-    ep, proxies = pick_proxies()
-    r = session.get("https://ip.decodo.com/json", timeout=(CONNECT_TO, READ_TO), proxies=proxies)
-    resp = Response(r.text, 200, {"Content-Type": "application/json"})
-    if ep: resp.headers["X-Proxy-Endpoint"] = ep
-    return resp
+    # >>> mudança: proteger contra exceções para não dar 500
+    try:
+        ep, proxies = pick_proxies()
+        r = session.get("https://ip.decodo.com/json", timeout=(CONNECT_TO, READ_TO), proxies=proxies)
+        resp = Response(r.text, 200, {"Content-Type": "application/json"})
+        if ep: resp.headers["X-Proxy-Endpoint"] = ep
+        return resp
+    except Exception as e:  # pega erros do requests e do curl_cffi
+        body = jsonify({"error": str(e)})
+        resp = Response(body.get_data(as_text=True), status=502, mimetype="application/json")
+        return add_cors(resp)
 
 @app.route("/_diag_endpoints", methods=["GET"])
 def _diag_endpoints():
@@ -195,7 +201,7 @@ def proxy(raw: str):
             verify=True,
             proxies=proxies1,
         )
-    except requests.RequestException as e:
+    except Exception as e:  # <<< mudança: capturar qualquer exceção (evita 500)
         body = jsonify({"error": str(e), "endpoint": ep1 or ""})
         resp = Response(body.get_data(as_text=True), status=502, mimetype="application/json")
         if ep1: resp.headers["X-Proxy-Endpoint"] = ep1
@@ -219,7 +225,7 @@ def proxy(raw: str):
                 proxies=proxies2,
             )
             if ep2: ep1 = ep2  # reportar a porta final que respondeu
-        except requests.RequestException as e:
+        except Exception as e:  # <<< mudança: capturar qualquer exceção
             body = jsonify({"error": str(e), "endpoint": ep2 or ep1 or ""})
             resp = Response(body.get_data(as_text=True), status=502, mimetype="application/json")
             if ep2 or ep1: resp.headers["X-Proxy-Endpoint"] = (ep2 or ep1)
@@ -245,4 +251,3 @@ def proxy(raw: str):
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", "8080")))
-
