@@ -3,3 +3,5 @@ Flask-Cors==5.0.0
 gunicorn==23.0.0
 requests==2.32.3
 urllib3==2.3.0
+curl_cffi==0.6.2
+
