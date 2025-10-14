@@ -33,16 +33,26 @@ JIT_MIN = float(os.getenv("SP_JITTER_MIN", "0.10"))
 JIT_MAX = float(os.getenv("SP_JITTER_MAX", "0.25"))
 
 # ===== sessão HTTP =====
-session = requests.Session()
-retry = Retry(
-    total=1, backoff_factor=0.0,
-    status_forcelist=[429, 500, 502, 503, 504],
-    allowed_methods=frozenset(["HEAD", "GET", "OPTIONS"])
-)
-adapter = HTTPAdapter(max_retries=retry, pool_connections=POOL_CONN, pool_maxsize=POOL_MAX)
-session.mount("https://", adapter)
-session.mount("http://", adapter)
-session.trust_env = False
+USE_CURL = os.getenv("HTTP_BACKEND", "").lower() == "curl"
+
+if USE_CURL:
+    # Backend com fingerprint de Chrome
+    from curl_cffi import requests as creq
+    session = creq.Session()
+    session.impersonate = "chrome120"   # Chrome 120 (estável)
+    # nada de HTTPAdapter aqui – o curl_cffi gerencia conexões
+else:
+    # Backend padrão (requests)
+    session = requests.Session()
+    retry = Retry(
+        total=1, backoff_factor=0.0,
+        status_forcelist=[429, 500, 502, 503, 504],
+        allowed_methods=frozenset(["HEAD", "GET", "OPTIONS"])
+    )
+    adapter = HTTPAdapter(max_retries=retry, pool_connections=POOL_CONN, pool_maxsize=POOL_MAX)
+    session.mount("https://", adapter)
+    session.mount("http://", adapter)
+    session.trust_env = False
 
 # round-robin de portas (ou única porta)
 _cycle = itertools.cycle(ENDPOINTS) if ENDPOINTS else None
@@ -235,3 +245,4 @@ def proxy(raw: str):
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", "8080")))
+
