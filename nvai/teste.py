@@ -3,7 +3,7 @@ from flask import Flask, request, Response, jsonify
 from flask_cors import CORS
 import os, re, itertools, threading, time, random
 import requests
-from urllib.parse import urlparse, unquote
+from urllib.parse import urlparse, unquote, parse_qs
 from urllib3.util.retry import Retry
 from requests.adapters import HTTPAdapter
 
@@ -21,26 +21,34 @@ SP_PASSWORD = os.getenv("SP_PASSWORD", "").strip()
 _raw_eps = (os.getenv("SP_ENDPOINTS") or os.getenv("SP_ENDPOINT") or "").strip()
 ENDPOINTS = [e.strip() for e in re.split(r"[,\s]+", _raw_eps) if e.strip()]  # vírgula/esp/linhas
 
-CONNECT_TO = float(os.getenv("SP_CONNECT_TIMEOUT", "4"))
-READ_TO    = float(os.getenv("SP_READ_TIMEOUT", "6"))
+# timeouts/pool (curtos para não estourar 30s do SW)
+CONNECT_TO = float(os.getenv("SP_CONNECT_TIMEOUT", "3.5"))
+READ_TO    = float(os.getenv("SP_READ_TIMEOUT", "5.5"))
 POOL_CONN  = int(os.getenv("SP_POOL_CONNECTIONS", "100"))
 POOL_MAX   = int(os.getenv("SP_POOL_MAXSIZE", "200"))
 
+# anti-GAP + jitter (segundos)
 SP_GATE_RETRY = os.getenv("SP_GATE_RETRY", "1") == "1"
-JIT_MIN = float(os.getenv("SP_JITTER_MIN", "0.10"))
-JIT_MAX = float(os.getenv("SP_JITTER_MAX", "0.30"))
+JIT_MIN = float(os.getenv("SP_JITTER_MIN", "0.02"))   # ligeiro
+JIT_MAX = float(os.getenv("SP_JITTER_MAX", "0.12"))
+
+# 2nd chance em 5xx
+SP_SECOND_CHANCE_5XX = os.getenv("SP_SECOND_CHANCE_5XX", "1") == "1"
 
 # concorrência
-MAX_CONCURRENCY = int(os.getenv("SP_MAX_CONCURRENCY", "16"))  # ↑ para evitar fila > 30s
+MAX_CONCURRENCY = int(os.getenv("SP_MAX_CONCURRENCY", "16"))
 _sem = threading.Semaphore(MAX_CONCURRENCY)
 
 # sticky: lotes e atrasos (milissegundos)
 BATCH_MIN = int(os.getenv("SP_STICKY_BATCH_MIN", "3"))
-BATCH_MAX = int(os.getenv("SP_STICKY_BATCH_MAX", "7"))
-ASSIGN_JIT_MS_MIN = int(os.getenv("SP_ASSIGN_JITTER_MS_MIN", "40"))
-ASSIGN_JIT_MS_MAX = int(os.getenv("SP_ASSIGN_JITTER_MS_MAX", "120"))
-PER_IP_DELAY_MS_MIN = int(os.getenv("SP_PER_IP_DELAY_MS_MIN", "120"))
-PER_IP_DELAY_MS_MAX = int(os.getenv("SP_PER_IP_DELAY_MS_MAX", "350"))
+BATCH_MAX = int(os.getenv("SP_STICKY_BATCH_MAX", "6"))
+ASSIGN_JIT_MS_MIN = int(os.getenv("SP_ASSIGN_JITTER_MS_MIN", "20"))
+ASSIGN_JIT_MS_MAX = int(os.getenv("SP_ASSIGN_JITTER_MS_MAX", "80"))
+PER_IP_DELAY_MS_MIN = int(os.getenv("SP_PER_IP_DELAY_MS_MIN", "80"))
+PER_IP_DELAY_MS_MAX = int(os.getenv("SP_PER_IP_DELAY_MS_MAX", "220"))
+
+# “forçar item”: se final for /p/?pdp_filters=item_id:MLB...
+SP_CANONICALIZE_ITEM = os.getenv("SP_CANONICALIZE_ITEM", "1") == "1"
 
 SP_REFERER = os.getenv("SP_REFERER", "").strip()
 
@@ -56,13 +64,13 @@ session.mount("https://", adapter)
 session.mount("http://", adapter)
 session.trust_env = False
 
-# ===== headers =====
+# ===== headers “de navegador” =====
 DEFAULT_OUT_HEADERS = {
     "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
                    "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"),
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
     "Accept-Language": "pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7",
-    "Accept-Encoding": "gzip, deflate",
+    "Accept-Encoding": "gzip, deflate",  # sem 'br'
     "Connection": "keep-alive",
     "Upgrade-Insecure-Requests": "1",
     "sec-ch-ua": '"Chromium";v="120", "Google Chrome";v="120", "Not A(Brand";v="24"',
@@ -100,8 +108,7 @@ def add_cors(resp: Response):
     )
     resp.headers["Access-Control-Expose-Headers"] = (
         "Content-Type, ETag, Cache-Control, Last-Modified, Location, Content-Range, "
-        "Content-Length, X-Proxy-Final-Url, X-Proxy-Actual-Url, X-Proxy-Redirect-Count, "
-        "X-Proxy-Endpoint, X-Proxy-Error, X-Proxy-Queue-Wait"
+        "Content-Length, X-Proxy-Final-Url, X-Proxy-Redirect-Count, X-Proxy-Endpoint, X-Proxy-Error, X-Proxy-Action"
     )
     resp.headers["Access-Control-Max-Age"] = "86400"
     resp.headers["Vary"] = "Origin, Access-Control-Request-Headers, Access-Control-Request-Method"
@@ -115,10 +122,32 @@ def looks_like_gate(resp) -> bool:
         ct = resp.headers.get("content-type","")
         if "text/html" in ct:
             body = (resp.content or b"")[:40000].lower()
-            if b"account-verification" in body: return True
+            if b"account-verification" in body:
+                return True
     except Exception:
         pass
     return False
+
+def extract_mlb_from_url(s: str) -> str|None:
+    # tenta MLB-##########
+    m = re.search(r"(MLB-\d+)", s, re.I)
+    if m: return m.group(1).upper()
+    # tenta MLB##########
+    m = re.search(r"(MLB\d+)", s, re.I)
+    if m: return m.group(1).upper()
+    return None
+
+def extract_mlb_from_pdp_filters(url: str) -> str|None:
+    try:
+        q = parse_qs(urlparse(url).query)
+        filt = q.get("pdp_filters", [])
+        if not filt: return None
+        joined = ",".join(filt)
+        m = re.search(r"item_id:(MLB-?\d+)", joined, re.I)
+        if m: return m.group(1).upper().replace("MLB-", "MLB-")
+    except Exception:
+        pass
+    return None
 
 # ===== sticky scheduler =====
 class EpState:
@@ -141,12 +170,8 @@ def pick_sticky_endpoint():
     global _idx
     if not _states:
         return None, None, 0.0
-
     with _lock:
-        # jitter entre IPs
         time.sleep(_ms(random.randint(ASSIGN_JIT_MS_MIN, ASSIGN_JIT_MS_MAX)))
-
-        # tenta usar quem ainda tem "remaining"
         for _ in range(len(_states)):
             s = _states[_idx]
             _idx = (_idx + 1) % len(_states)
@@ -159,7 +184,6 @@ def pick_sticky_endpoint():
             _idx = (_idx + 1) % len(_states)
             s.remaining = _new_batch() - 1
             chosen = s
-
         now = time.time()
         need_gap = random.randint(PER_IP_DELAY_MS_MIN, PER_IP_DELAY_MS_MAX)
         sleep_needed = 0.0
@@ -169,26 +193,10 @@ def pick_sticky_endpoint():
                 sleep_needed = _ms(need_gap - int(elapsed_ms))
         chosen.last_ts = max(now, now + sleep_needed)
         ep = chosen.endpoint
-
     proxy = f"http://{SP_USERNAME}:{SP_PASSWORD}@{ep}"
     return ep, {"http": proxy, "https": proxy}, sleep_needed
 
-# ===== diagnósticos =====
-@app.route("/_diag_endpoints", methods=["GET"])
-def _diag_endpoints():
-    out = []
-    for ep in ENDPOINTS:
-        proxies = {"http": f"http://{SP_USERNAME}:{SP_PASSWORD}@{ep}",
-                   "https": f"http://{SP_USERNAME}:{SP_PASSWORD}@{ep}"}
-        item = {"endpoint": ep}
-        try:
-            rr = session.get("https://ip.decodo.com/json", timeout=(2.5, 4.0), proxies=proxies)
-            item["ok"] = True; item["status"] = rr.status_code
-        except Exception as e:
-            item["ok"] = False; item["error"] = str(e)
-        out.append(item)
-    return jsonify(out), 200
-
+# ===== rotas =====
 @app.route("/", defaults={"raw": ""}, methods=["OPTIONS"])
 @app.route("/<path:raw>", methods=["OPTIONS"])
 def _opts(raw):
@@ -218,7 +226,6 @@ def proxy(raw: str):
     if not raw:
         return add_cors(Response("OK - use /https://<url-destino>", status=200))
 
-    # Guarda a URL original para fix do card
     orig_target = unquote(raw)
     target = orig_target
     q = request.query_string.decode("utf-8")
@@ -236,28 +243,30 @@ def proxy(raw: str):
 
     if JIT_MAX > 0: time.sleep(random.uniform(JIT_MIN, JIT_MAX))
 
-    queue_t0 = time.time()
+    action = []
+
+    def do_request(ep, proxies):
+        return session.request(
+            method=request.method,
+            url=target,
+            headers=headers,
+            allow_redirects=True,
+            timeout=(CONNECT_TO, READ_TO),
+            verify=True,
+            stream=False,
+            proxies=proxies,
+        )
+
     with _sem:
-        queue_wait_ms = int((time.time() - queue_t0) * 1000.0)
         ep1, proxies1, extra_sleep = pick_sticky_endpoint()
         if extra_sleep: time.sleep(extra_sleep)
         try:
-            r = session.request(
-                method=request.method,
-                url=target,
-                headers=headers,
-                allow_redirects=True,
-                timeout=(CONNECT_TO, READ_TO),
-                verify=True,
-                stream=False,
-                proxies=proxies1,
-            )
+            r = do_request(ep1, proxies1)
         except Exception as e:
             body = jsonify({"error": str(e), "endpoint": ep1 or ""})
             resp = Response(body.get_data(as_text=True), status=502, mimetype="application/json")
             if ep1: resp.headers["X-Proxy-Endpoint"] = ep1
             resp.headers["X-Proxy-Error"] = str(e)
-            resp.headers["X-Proxy-Queue-Wait"] = str(queue_wait_ms)
             return add_cors(resp)
 
     # retry 1x se GAP
@@ -266,26 +275,60 @@ def proxy(raw: str):
             ep2, proxies2, extra_sleep2 = pick_sticky_endpoint()
             if extra_sleep2: time.sleep(extra_sleep2)
             try:
-                r2 = session.request(
-                    method=request.method,
-                    url=target,
-                    headers=headers,
-                    allow_redirects=True,
-                    timeout=(CONNECT_TO, READ_TO),
-                    verify=True,
-                    stream=False,
-                    proxies=proxies2,
-                )
+                r2 = do_request(ep2, proxies2)
                 if not looks_like_gate(r2):
-                    r, ep1 = r2, (ep2 or ep1)
+                    r, ep1 = r2, (ep2 or ep1); action.append("gate-retry")
             except Exception as e:
                 body = jsonify({"error": str(e), "endpoint": ep2 or ep1 or ""})
                 resp = Response(body.get_data(as_text=True), status=502, mimetype="application/json")
                 if ep2 or ep1: resp.headers["X-Proxy-Endpoint"] = (ep2 or ep1)
                 resp.headers["X-Proxy-Error"] = str(e)
-                resp.headers["X-Proxy-Queue-Wait"] = str(queue_wait_ms)
                 return add_cors(resp)
 
+    # 2nd-chance em 5xx
+    if SP_SECOND_CHANCE_5XX and r.status_code in (502,503,504):
+        with _sem:
+            ep3, proxies3, extra_sleep3 = pick_sticky_endpoint()
+            if extra_sleep3: time.sleep(extra_sleep3)
+            try:
+                r3 = do_request(ep3, proxies3)
+                if r3.status_code < 500:
+                    r, ep1 = r3, (ep3 or ep1); action.append("retry-5xx")
+            except Exception as e:
+                # mantém r original; só reporta header
+                action.append(f"retry-5xx-error:{str(e)[:30]}")
+
+    # Canonização: se final foi /p/ (catálogo), tenta devolver /produto/MLB-XXXX
+    if SP_CANONICALIZE_ITEM:
+        final_url = getattr(r, "url", "") or ""
+        if ("//www.mercadolivre.com.br/" in final_url) and ("/p/" in final_url):
+            mlb = extract_mlb_from_pdp_filters(final_url) or extract_mlb_from_url(orig_target)
+            if mlb:
+                force_url = f"https://produto.mercadolivre.com.br/{mlb}"
+                # finge navegação: usa o catálogo como referer
+                forced_headers = dict(headers)
+                forced_headers["Referer"] = final_url
+                with _sem:
+                    ep4, proxies4, extra_sleep4 = pick_sticky_endpoint()
+                    if extra_sleep4: time.sleep(extra_sleep4)
+                    try:
+                        r4 = session.request(
+                            method=request.method,
+                            url=force_url,
+                            headers=forced_headers,
+                            allow_redirects=True,
+                            timeout=(CONNECT_TO, READ_TO),
+                            verify=True,
+                            stream=False,
+                            proxies=proxies4,
+                        )
+                        # só troca se não caiu em gate
+                        if r4.status_code < 500 and not looks_like_gate(r4):
+                            r, ep1 = r4, (ep4 or ep1); action.append("canon-item")
+                    except Exception as e:
+                        action.append(f"canon-error:{str(e)[:30]}")
+
+    # resposta
     resp = Response(r.content if request.method == "GET" else b"", status=r.status_code)
     hop_by_hop = {"transfer-encoding","connection","keep-alive","proxy-authenticate",
                   "proxy-authorization","te","trailers","upgrade"}
@@ -296,12 +339,10 @@ def proxy(raw: str):
                   "content-range","accept-ranges","location","content-length"):
             resp.headers[k] = v
 
-    # >>> FIX DO CARD: mantenha a URL original no header usado pela UI
-    resp.headers["X-Proxy-Final-Url"] = orig_target          # chave do card (sempre item)
-    resp.headers["X-Proxy-Actual-Url"] = getattr(r, "url", target)  # debug: onde buscamos de fato
+    resp.headers["X-Proxy-Final-Url"] = getattr(r, "url", target)
     resp.headers["X-Proxy-Redirect-Count"] = str(len(getattr(r, "history", [])))
     if ep1: resp.headers["X-Proxy-Endpoint"] = ep1
-    resp.headers["X-Proxy-Queue-Wait"] = str(queue_wait_ms)
+    if action: resp.headers["X-Proxy-Action"] = ",".join(action)
     return add_cors(resp)
 
 if __name__ == "__main__":
