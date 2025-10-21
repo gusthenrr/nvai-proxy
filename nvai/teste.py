@@ -19,9 +19,9 @@ SP_USERNAME = os.getenv("SP_USERNAME", "").strip()
 SP_PASSWORD = os.getenv("SP_PASSWORD", "").strip()
 
 _raw_eps = (os.getenv("SP_ENDPOINTS") or os.getenv("SP_ENDPOINT") or "").strip()
-ENDPOINTS = [e.strip() for e in re.split(r"[,\s]+", _raw_eps) if e.strip()]  # vírgula/esp/linhas
+ENDPOINTS = [e.strip() for e in re.split(r"[,\s]+", _raw_eps) if e.strip()]
 
-# timeouts/pool (curtos para não estourar 30s do SW)
+# timeouts/pool (curtos p/ caber no budget do SW)
 CONNECT_TO = float(os.getenv("SP_CONNECT_TIMEOUT", "3.5"))
 READ_TO    = float(os.getenv("SP_READ_TIMEOUT", "5.5"))
 POOL_CONN  = int(os.getenv("SP_POOL_CONNECTIONS", "100"))
@@ -29,7 +29,7 @@ POOL_MAX   = int(os.getenv("SP_POOL_MAXSIZE", "200"))
 
 # anti-GAP + jitter (segundos)
 SP_GATE_RETRY = os.getenv("SP_GATE_RETRY", "1") == "1"
-JIT_MIN = float(os.getenv("SP_JITTER_MIN", "0.02"))   # ligeiro
+JIT_MIN = float(os.getenv("SP_JITTER_MIN", "0.02"))
 JIT_MAX = float(os.getenv("SP_JITTER_MAX", "0.12"))
 
 # 2nd chance em 5xx
@@ -39,7 +39,7 @@ SP_SECOND_CHANCE_5XX = os.getenv("SP_SECOND_CHANCE_5XX", "1") == "1"
 MAX_CONCURRENCY = int(os.getenv("SP_MAX_CONCURRENCY", "16"))
 _sem = threading.Semaphore(MAX_CONCURRENCY)
 
-# sticky: lotes e atrasos (milissegundos)
+# sticky: lotes e atrasos (ms)
 BATCH_MIN = int(os.getenv("SP_STICKY_BATCH_MIN", "3"))
 BATCH_MAX = int(os.getenv("SP_STICKY_BATCH_MAX", "6"))
 ASSIGN_JIT_MS_MIN = int(os.getenv("SP_ASSIGN_JITTER_MS_MIN", "20"))
@@ -47,7 +47,7 @@ ASSIGN_JIT_MS_MAX = int(os.getenv("SP_ASSIGN_JITTER_MS_MAX", "80"))
 PER_IP_DELAY_MS_MIN = int(os.getenv("SP_PER_IP_DELAY_MS_MIN", "80"))
 PER_IP_DELAY_MS_MAX = int(os.getenv("SP_PER_IP_DELAY_MS_MAX", "220"))
 
-# “forçar item”: se final for /p/?pdp_filters=item_id:MLB...
+# canonização ligada por padrão
 SP_CANONICALIZE_ITEM = os.getenv("SP_CANONICALIZE_ITEM", "1") == "1"
 
 SP_REFERER = os.getenv("SP_REFERER", "").strip()
@@ -108,7 +108,8 @@ def add_cors(resp: Response):
     )
     resp.headers["Access-Control-Expose-Headers"] = (
         "Content-Type, ETag, Cache-Control, Last-Modified, Location, Content-Range, "
-        "Content-Length, X-Proxy-Final-Url, X-Proxy-Redirect-Count, X-Proxy-Endpoint, X-Proxy-Error, X-Proxy-Action"
+        "Content-Length, X-Proxy-Final-Url, X-Proxy-Redirect-Count, X-Proxy-Endpoint, "
+        "X-Proxy-Error, X-Proxy-Action"
     )
     resp.headers["Access-Control-Max-Age"] = "86400"
     resp.headers["Vary"] = "Origin, Access-Control-Request-Headers, Access-Control-Request-Method"
@@ -128,14 +129,21 @@ def looks_like_gate(resp) -> bool:
         pass
     return False
 
-def extract_mlb_from_url(s: str) -> str|None:
-    # tenta MLB-##########
-    m = re.search(r"(MLB-\d+)", s, re.I)
-    if m: return m.group(1).upper()
-    # tenta MLB##########
-    m = re.search(r"(MLB\d+)", s, re.I)
-    if m: return m.group(1).upper()
-    return None
+# ---- NOVO: normalizador robusto de MLB (sempre volta "MLB-1234567890")
+def normalize_mlb(s: str|None) -> str|None:
+    if not s: return None
+    m = re.search(r"MLB-?(\d+)", s, re.I)
+    if not m: return None
+    return f"MLB-{m.group(1)}".upper()
+
+def extract_mlb_from_url(url: str) -> str|None:
+    try:
+        # procura MLB-123 ou MLB123 no PATH/QUERY
+        m = re.search(r"(MLB-?\d+)", url, re.I)
+        if not m: return None
+        return normalize_mlb(m.group(1))
+    except Exception:
+        return None
 
 def extract_mlb_from_pdp_filters(url: str) -> str|None:
     try:
@@ -144,10 +152,10 @@ def extract_mlb_from_pdp_filters(url: str) -> str|None:
         if not filt: return None
         joined = ",".join(filt)
         m = re.search(r"item_id:(MLB-?\d+)", joined, re.I)
-        if m: return m.group(1).upper().replace("MLB-", "MLB-")
+        if not m: return None
+        return normalize_mlb(m.group(1))
     except Exception:
-        pass
-    return None
+        return None
 
 # ===== sticky scheduler =====
 class EpState:
@@ -245,11 +253,11 @@ def proxy(raw: str):
 
     action = []
 
-    def do_request(ep, proxies):
+    def do_request(ep, proxies, url_to_get, hdrs):
         return session.request(
             method=request.method,
-            url=target,
-            headers=headers,
+            url=url_to_get,
+            headers=hdrs,
             allow_redirects=True,
             timeout=(CONNECT_TO, READ_TO),
             verify=True,
@@ -257,11 +265,12 @@ def proxy(raw: str):
             proxies=proxies,
         )
 
+    # 1ª chamada
     with _sem:
         ep1, proxies1, extra_sleep = pick_sticky_endpoint()
         if extra_sleep: time.sleep(extra_sleep)
         try:
-            r = do_request(ep1, proxies1)
+            r = do_request(ep1, proxies1, target, headers)
         except Exception as e:
             body = jsonify({"error": str(e), "endpoint": ep1 or ""})
             resp = Response(body.get_data(as_text=True), status=502, mimetype="application/json")
@@ -275,7 +284,7 @@ def proxy(raw: str):
             ep2, proxies2, extra_sleep2 = pick_sticky_endpoint()
             if extra_sleep2: time.sleep(extra_sleep2)
             try:
-                r2 = do_request(ep2, proxies2)
+                r2 = do_request(ep2, proxies2, target, headers)
                 if not looks_like_gate(r2):
                     r, ep1 = r2, (ep2 or ep1); action.append("gate-retry")
             except Exception as e:
@@ -285,46 +294,47 @@ def proxy(raw: str):
                 resp.headers["X-Proxy-Error"] = str(e)
                 return add_cors(resp)
 
-    # 2nd-chance em 5xx
+    # 2nd-chance para 5xx
     if SP_SECOND_CHANCE_5XX and r.status_code in (502,503,504):
         with _sem:
             ep3, proxies3, extra_sleep3 = pick_sticky_endpoint()
             if extra_sleep3: time.sleep(extra_sleep3)
             try:
-                r3 = do_request(ep3, proxies3)
+                r3 = do_request(ep3, proxies3, target, headers)
                 if r3.status_code < 500:
                     r, ep1 = r3, (ep3 or ep1); action.append("retry-5xx")
             except Exception as e:
-                # mantém r original; só reporta header
                 action.append(f"retry-5xx-error:{str(e)[:30]}")
 
-    # Canonização: se final foi /p/ (catálogo), tenta devolver /produto/MLB-XXXX
+    # ======= CANONIZAÇÃO (resolve /p/, /up/ e pdp_filters) =======
     if SP_CANONICALIZE_ITEM:
         final_url = getattr(r, "url", "") or ""
-        if ("//www.mercadolivre.com.br/" in final_url) and ("/p/" in final_url):
-            mlb = extract_mlb_from_pdp_filters(final_url) or extract_mlb_from_url(orig_target)
+        u = urlparse(final_url)
+        host = (u.hostname or "").lower()
+        path = u.path or ""
+        query = u.query or ""
+        needs_item = (
+            host.endswith("mercadolivre.com.br")
+            and ("/p/" in path or "/up/" in path or "pdp_filters=" in query)
+        )
+
+        if needs_item:
+            # prioridade: pegar MLB do pdp_filters; senão do target original; senão da própria final_url
+            mlb = extract_mlb_from_pdp_filters(final_url) or extract_mlb_from_url(orig_target) or extract_mlb_from_url(final_url)
+            mlb = normalize_mlb(mlb)
             if mlb:
                 force_url = f"https://produto.mercadolivre.com.br/{mlb}"
-                # finge navegação: usa o catálogo como referer
                 forced_headers = dict(headers)
-                forced_headers["Referer"] = final_url
+                forced_headers["Referer"] = final_url  # navegação natural
                 with _sem:
                     ep4, proxies4, extra_sleep4 = pick_sticky_endpoint()
                     if extra_sleep4: time.sleep(extra_sleep4)
                     try:
-                        r4 = session.request(
-                            method=request.method,
-                            url=force_url,
-                            headers=forced_headers,
-                            allow_redirects=True,
-                            timeout=(CONNECT_TO, READ_TO),
-                            verify=True,
-                            stream=False,
-                            proxies=proxies4,
-                        )
-                        # só troca se não caiu em gate
+                        r4 = do_request(ep4, proxies4, force_url, forced_headers)
+                        # troca só se não gate e não 5xx
                         if r4.status_code < 500 and not looks_like_gate(r4):
-                            r, ep1 = r4, (ep4 or ep1); action.append("canon-item")
+                            r, ep1 = r4, (ep4 or ep1)
+                            action.append("canon-item")
                     except Exception as e:
                         action.append(f"canon-error:{str(e)[:30]}")
 
