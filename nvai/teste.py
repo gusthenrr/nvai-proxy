@@ -44,11 +44,20 @@ SP_REFERER = os.getenv("SP_REFERER","").strip()
 
 session = requests.Session()
 class _NoCookiesPolicy(cookielib.CookiePolicy):
-    rfc2965 = hide_cookie2 = True
-    def set_ok(self, *a, **kw): return False
-    def return_ok(self, *a, **kw): return False
-    def domain_return_ok(self, *a, **kw): return False
-    def path_return_ok(self, *a, **kw): return False
+    # flags que o CookieJar espera existir:
+    rfc2965 = False          # não aceitar RFC2965
+    netscape = False         # não aceitar formato "Netscape"
+    hide_cookie2 = True      # nunca enviar Cookie2
+
+    # assinaturas compatíveis com http.cookiejar
+    def set_ok(self, cookie, request):
+        return False
+    def return_ok(self, cookie, request):
+        return False
+    def domain_return_ok(self, domain, request):
+        return False
+    def path_return_ok(self, path, request):
+        return False
 
 # cria um jar vazio e bloqueia set/return
 session.cookies = cookielib.CookieJar()
@@ -385,6 +394,7 @@ def proxy(raw: str):
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.getenv("PORT","8080")))
+
 
 
 
