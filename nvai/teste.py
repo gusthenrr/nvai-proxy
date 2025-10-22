@@ -6,6 +6,7 @@ import requests
 from urllib.parse import urlparse, unquote, parse_qs
 from urllib3.util.retry import Retry
 from requests.adapters import HTTPAdapter
+import http.cookiejar as cookielib
 
 app = Flask(__name__)
 CORS(app, supports_credentials=True)
@@ -42,6 +43,16 @@ SP_CANONICALIZE_ITEM = os.getenv("SP_CANONICALIZE_ITEM", "1") == "1"
 SP_REFERER = os.getenv("SP_REFERER","").strip()
 
 session = requests.Session()
+class _NoCookiesPolicy(cookielib.CookiePolicy):
+    rfc2965 = hide_cookie2 = True
+    def set_ok(self, *a, **kw): return False
+    def return_ok(self, *a, **kw): return False
+    def domain_return_ok(self, *a, **kw): return False
+    def path_return_ok(self, *a, **kw): return False
+
+# cria um jar vazio e bloqueia set/return
+session.cookies = cookielib.CookieJar()
+session.cookies.set_policy(_NoCookiesPolicy())
 retry = Retry(total=1, backoff_factor=0.0,
               status_forcelist=[429,500,502,503,504],
               allowed_methods=frozenset(["HEAD","GET","OPTIONS"]))
@@ -54,7 +65,7 @@ DEFAULT_OUT_HEADERS = {
                    "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"),
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
     "Accept-Language": "pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7",
-    "Accept-Encoding": "gzip, deflate",  # evita 'br'
+    "Accept-Encoding": "gzip, deflate, br",  # evita 'br'
     "Connection": "keep-alive",
     "Upgrade-Insecure-Requests": "1",
     "sec-ch-ua": '"Chromium";v="120", "Google Chrome";v="120", "Not A(Brand";v="24"',
@@ -239,9 +250,17 @@ def proxy(raw: str):
     actions=[]; canonical_mlb=None; canon_from=""
 
     def do_request(ep, proxies, url_to_get, hdrs):
-        return session.request(method=request.method, url=url_to_get, headers=hdrs,
-                               allow_redirects=True, timeout=(CONNECT_TO,READ_TO),
-                               verify=True, stream=False, proxies=proxies)
+    return session.request(
+        method=request.method,
+        url=url_to_get,
+        headers=hdrs,
+        allow_redirects=True,
+        timeout=(CONNECT_TO, READ_TO),
+        verify=True,
+        stream=False,
+        proxies=proxies,
+        cookies={}  # <- zera cookies por requisição
+    )
 
     # 1ª chamada
     with _sem:
@@ -321,7 +340,9 @@ def proxy(raw: str):
 
             if canonical_mlb:
                 force_url = f"https://produto.mercadolivre.com.br/{canonical_mlb}"
-                forced_headers = dict(headers); forced_headers["Referer"] = final_url
+                forced_headers = dict(headers)
+                forced_headers["Referer"] = f"https://produto.mercadolivre.com.br/{canonical_mlb}"
+                forced_headers["sec-fetch-site"] = "same-origin"
                 with _sem:
                     ep4, proxies4, sleep4 = pick_sticky_endpoint()
                     if sleep4: time.sleep(sleep4)
@@ -363,3 +384,4 @@ def proxy(raw: str):
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.getenv("PORT","8080")))
+
