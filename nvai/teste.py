@@ -250,17 +250,17 @@ def proxy(raw: str):
     actions=[]; canonical_mlb=None; canon_from=""
 
     def do_request(ep, proxies, url_to_get, hdrs):
-    return session.request(
-        method=request.method,
-        url=url_to_get,
-        headers=hdrs,
-        allow_redirects=True,
-        timeout=(CONNECT_TO, READ_TO),
-        verify=True,
-        stream=False,
-        proxies=proxies,
-        cookies={}  # <- zera cookies por requisição
-    )
+        return session.request(
+            method=request.method,
+            url=url_to_get,
+            headers=hdrs,
+            allow_redirects=True,
+            timeout=(CONNECT_TO, READ_TO),
+            verify=True,
+            stream=False,
+            proxies=proxies,
+            cookies={}  # <- zera cookies por requisição
+        )
 
     # 1ª chamada
     with _sem:
@@ -384,4 +384,5 @@ def proxy(raw: str):
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.getenv("PORT","8080")))
+
 
