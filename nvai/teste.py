@@ -60,12 +60,13 @@ adapter = HTTPAdapter(max_retries=retry, pool_connections=POOL_CONN, pool_maxsiz
 session.mount("https://", adapter); session.mount("http://", adapter)
 session.trust_env = False
 
+# --- onde você define os headers padrão ---
 DEFAULT_OUT_HEADERS = {
     "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
                    "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"),
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
     "Accept-Language": "pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7",
-    "Accept-Encoding": "gzip, deflate, br",  # evita 'br'
+    "Accept-Encoding": "gzip, deflate, br",  # aceita brotli como um navegador real
     "Connection": "keep-alive",
     "Upgrade-Insecure-Requests": "1",
     "sec-ch-ua": '"Chromium";v="120", "Google Chrome";v="120", "Not A(Brand";v="24"',
@@ -76,6 +77,7 @@ DEFAULT_OUT_HEADERS = {
     "sec-fetch-user": "?1",
     "sec-fetch-dest": "document",
 }
+
 if SP_REFERER:
     DEFAULT_OUT_HEADERS["Referer"] = SP_REFERER
     DEFAULT_OUT_HEADERS["sec-fetch-site"] = "same-origin"
@@ -363,8 +365,7 @@ def proxy(raw: str):
     for k,v in r.headers.items():
         lk=k.lower()
         if lk in hop_by_hop: continue
-        if lk in ("content-type","cache-control","etag","last-modified",
-                  "content-range","accept-ranges","location","content-length"):
+        if lk in ("content-type","cache-control","etag","last-modified","content-encoding","content-range","accept-ranges","location","vary"):
             resp.headers[k]=v
 
     # final/report
@@ -384,5 +385,6 @@ def proxy(raw: str):
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.getenv("PORT","8080")))
+
 
 
