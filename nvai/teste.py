@@ -21,7 +21,7 @@ SP_PASSWORD = os.getenv("SP_PASSWORD", "").strip()
 _raw_eps = (os.getenv("SP_ENDPOINTS") or os.getenv("SP_ENDPOINT") or "").strip()
 ENDPOINTS = [e.strip() for e in re.split(r"[,\s]+", _raw_eps) if e.strip()]
 
-# timeouts/pool
+# timeouts/pool (curtos p/ caber no budget do SW)
 CONNECT_TO = float(os.getenv("SP_CONNECT_TIMEOUT", "3.5"))
 READ_TO    = float(os.getenv("SP_READ_TIMEOUT", "5.5"))
 POOL_CONN  = int(os.getenv("SP_POOL_CONNECTIONS", "100"))
@@ -47,7 +47,9 @@ ASSIGN_JIT_MS_MAX = int(os.getenv("SP_ASSIGN_JITTER_MS_MAX", "80"))
 PER_IP_DELAY_MS_MIN = int(os.getenv("SP_PER_IP_DELAY_MS_MIN", "80"))
 PER_IP_DELAY_MS_MAX = int(os.getenv("SP_PER_IP_DELAY_MS_MAX", "220"))
 
+# canonização ligada por padrão
 SP_CANONICALIZE_ITEM = os.getenv("SP_CANONICALIZE_ITEM", "1") == "1"
+
 SP_REFERER = os.getenv("SP_REFERER", "").strip()
 
 # ===== sessão HTTP =====
@@ -127,7 +129,7 @@ def looks_like_gate(resp) -> bool:
         pass
     return False
 
-# ---------- normalização e extrações de MLB ----------
+# ---- NOVO: normalizador robusto de MLB (sempre volta "MLB-1234567890")
 def normalize_mlb(s: str|None) -> str|None:
     if not s: return None
     m = re.search(r"MLB-?(\d+)", s, re.I)
@@ -135,55 +137,25 @@ def normalize_mlb(s: str|None) -> str|None:
     return f"MLB-{m.group(1)}".upper()
 
 def extract_mlb_from_url(url: str) -> str|None:
-    m = re.search(r"(MLB-?\d+)", url or "", re.I)
-    return normalize_mlb(m.group(1)) if m else None
+    try:
+        # procura MLB-123 ou MLB123 no PATH/QUERY
+        m = re.search(r"(MLB-?\d+)", url, re.I)
+        if not m: return None
+        return normalize_mlb(m.group(1))
+    except Exception:
+        return None
 
 def extract_mlb_from_pdp_filters(url: str) -> str|None:
     try:
         q = parse_qs(urlparse(url).query)
-        for key, vals in q.items():
-            if key.lower() == "pdp_filters":
-                joined = ",".join(vals)
-                m = re.search(r"item_id:(MLB-?\d+)", joined, re.I)
-                if m: return normalize_mlb(m.group(1))
+        filt = q.get("pdp_filters", [])
+        if not filt: return None
+        joined = ",".join(filt)
+        m = re.search(r"item_id:(MLB-?\d+)", joined, re.I)
+        if not m: return None
+        return normalize_mlb(m.group(1))
     except Exception:
-        pass
-    return None
-
-def extract_mlb_from_html(html: bytes) -> str|None:
-    try:
-        txt = html.decode("utf-8", errors="ignore")
-    except Exception:
-        try: txt = html.decode("latin-1", errors="ignore")
-        except Exception: return None
-
-    # 1) canonical href
-    m = re.search(r'rel=["\']canonical["\'][^>]*href=["\']([^"\']+)["\']', txt, re.I)
-    if m:
-        href = m.group(1)
-        mlb = extract_mlb_from_url(href)
-        if mlb: return mlb
-
-    # 2) og:url
-    m = re.search(r'property=["\']og:url["\'][^>]*content=["\']([^"\']+)["\']', txt, re.I)
-    if m:
-        og = m.group(1)
-        mlb = extract_mlb_from_url(og)
-        if mlb: return mlb
-
-    # 3) link explícito para produto
-    m = re.search(r'https?://produto\.mercadolivre\.com\.br/MLB-?\d+', txt, re.I)
-    if m:
-        mlb = extract_mlb_from_url(m.group(0))
-        if mlb: return mlb
-
-    # 4) qualquer MLB no HTML
-    m = re.search(r'\b(MLB-?\d+)\b', txt, re.I)
-    if m:
-        mlb = normalize_mlb(m.group(1))
-        if mlb: return mlb
-
-    return None
+        return None
 
 # ===== sticky scheduler =====
 class EpState:
@@ -279,7 +251,7 @@ def proxy(raw: str):
 
     if JIT_MAX > 0: time.sleep(random.uniform(JIT_MIN, JIT_MAX))
 
-    actions = []
+    action = []
 
     def do_request(ep, proxies, url_to_get, hdrs):
         return session.request(
@@ -306,7 +278,7 @@ def proxy(raw: str):
             resp.headers["X-Proxy-Error"] = str(e)
             return add_cors(resp)
 
-    # anti-GAP retry
+    # retry 1x se GAP
     if SP_GATE_RETRY and looks_like_gate(r):
         with _sem:
             ep2, proxies2, extra_sleep2 = pick_sticky_endpoint()
@@ -314,7 +286,7 @@ def proxy(raw: str):
             try:
                 r2 = do_request(ep2, proxies2, target, headers)
                 if not looks_like_gate(r2):
-                    r, ep1 = r2, (ep2 or ep1); actions.append("gate-retry")
+                    r, ep1 = r2, (ep2 or ep1); action.append("gate-retry")
             except Exception as e:
                 body = jsonify({"error": str(e), "endpoint": ep2 or ep1 or ""})
                 resp = Response(body.get_data(as_text=True), status=502, mimetype="application/json")
@@ -322,7 +294,7 @@ def proxy(raw: str):
                 resp.headers["X-Proxy-Error"] = str(e)
                 return add_cors(resp)
 
-    # 2nd-chance em 5xx
+    # 2nd-chance para 5xx
     if SP_SECOND_CHANCE_5XX and r.status_code in (502,503,504):
         with _sem:
             ep3, proxies3, extra_sleep3 = pick_sticky_endpoint()
@@ -330,70 +302,41 @@ def proxy(raw: str):
             try:
                 r3 = do_request(ep3, proxies3, target, headers)
                 if r3.status_code < 500:
-                    r, ep1 = r3, (ep3 or ep1); actions.append("retry-5xx")
+                    r, ep1 = r3, (ep3 or ep1); action.append("retry-5xx")
             except Exception as e:
-                actions.append(f"retry-5xx-error:{str(e)[:30]}")
+                action.append(f"retry-5xx-error:{str(e)[:30]}")
 
-    # ======= CANONIZAÇÃO ROBUSTA =======
+    # ======= CANONIZAÇÃO (resolve /p/, /up/ e pdp_filters) =======
     if SP_CANONICALIZE_ITEM:
         final_url = getattr(r, "url", "") or ""
         u = urlparse(final_url)
         host = (u.hostname or "").lower()
         path = u.path or ""
         query = u.query or ""
-
-        def force_to_prod(mlb_code: str, referer_url: str):
-            force_url = f"https://produto.mercadolivre.com.br/{normalize_mlb(mlb_code)}"
-            forced_headers = dict(headers)
-            forced_headers["Referer"] = referer_url
-            with _sem:
-                epf, proxiesf, sleepf = pick_sticky_endpoint()
-                if sleepf: time.sleep(sleepf)
-                rf = do_request(epf, proxiesf, force_url, forced_headers)
-                return rf, epf
-
-        # Caso 0: já está em produto mas sem hífen → corrige
-        if host == "produto.mercadolivre.com.br":
-            # /MLB123456 -> /MLB-123456
-            m = re.search(r"/MLB(\d+)$", path, re.I)
-            if m:
-                rf, epf = force_to_prod(f"MLB-{m.group(1)}", final_url)
-                if rf.status_code < 500 and not looks_like_gate(rf):
-                    r, ep1 = rf, (epf or ep1); actions.append("canon-fix-hyphen")
-
-        # Caso 1: URL catálogo (/p/ ou /up/ ou tem pdp_filters)
-        needs_prod = (
+        needs_item = (
             host.endswith("mercadolivre.com.br")
-            and ("/p/" in path or "/up/" in path or "pdp_filters=" in query or host != "produto.mercadolivre.com.br")
+            and ("/p/" in path or "/up/" in path or "pdp_filters=" in query)
         )
-        if needs_prod:
-            # ordem de descoberta do MLB
-            mlb = (
-                extract_mlb_from_pdp_filters(final_url)
-                or extract_mlb_from_url(orig_target)
-                or extract_mlb_from_url(final_url)
-            )
-            if not mlb and r.headers.get("content-type","").lower().startswith("text/html"):
-                mlb = extract_mlb_from_html(r.content)
 
+        if needs_item:
+            # prioridade: pegar MLB do pdp_filters; senão do target original; senão da própria final_url
+            mlb = extract_mlb_from_pdp_filters(final_url) or extract_mlb_from_url(orig_target) or extract_mlb_from_url(final_url)
             mlb = normalize_mlb(mlb)
-
             if mlb:
-                rf, epf = force_to_prod(mlb, final_url)
-                if rf.status_code < 500 and not looks_like_gate(rf):
-                    r, ep1 = rf, (epf or ep1); actions.append("canon-item")
-            else:
-                # fallback: tentar pegar canonical href/og:url que já aponte direto para produto.*
-                if r.headers.get("content-type","").lower().startswith("text/html"):
+                force_url = f"https://produto.mercadolivre.com.br/{mlb}"
+                forced_headers = dict(headers)
+                forced_headers["Referer"] = final_url  # navegação natural
+                with _sem:
+                    ep4, proxies4, extra_sleep4 = pick_sticky_endpoint()
+                    if extra_sleep4: time.sleep(extra_sleep4)
                     try:
-                        txt = r.content.decode("utf-8", errors="ignore")
-                    except Exception:
-                        txt = ""
-                    m = re.search(r'https?://produto\.mercadolivre\.com\.br/MLB-?\d+', txt, re.I)
-                    if m:
-                        rf, epf = force_to_prod(m.group(0), final_url)
-                        if rf.status_code < 500 and not looks_like_gate(rf):
-                            r, ep1 = rf, (epf or ep1); actions.append("canon-from-html-url")
+                        r4 = do_request(ep4, proxies4, force_url, forced_headers)
+                        # troca só se não gate e não 5xx
+                        if r4.status_code < 500 and not looks_like_gate(r4):
+                            r, ep1 = r4, (ep4 or ep1)
+                            action.append("canon-item")
+                    except Exception as e:
+                        action.append(f"canon-error:{str(e)[:30]}")
 
     # resposta
     resp = Response(r.content if request.method == "GET" else b"", status=r.status_code)
@@ -409,7 +352,7 @@ def proxy(raw: str):
     resp.headers["X-Proxy-Final-Url"] = getattr(r, "url", target)
     resp.headers["X-Proxy-Redirect-Count"] = str(len(getattr(r, "history", [])))
     if ep1: resp.headers["X-Proxy-Endpoint"] = ep1
-    if actions: resp.headers["X-Proxy-Action"] = ",".join(actions)
+    if action: resp.headers["X-Proxy-Action"] = ",".join(action)
     return add_cors(resp)
 
 if __name__ == "__main__":
