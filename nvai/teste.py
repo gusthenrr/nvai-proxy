@@ -3,7 +3,7 @@ from flask import Flask, request, Response, jsonify
 from flask_cors import CORS
 import os, re, itertools, threading, time, random
 import requests
-from urllib.parse import urlparse, unquote, parse_qs
+from urllib.parse import urlparse, unquote, parse_qs, quote
 from urllib3.util.retry import Retry
 from requests.adapters import HTTPAdapter
 import http.cookiejar as cookielib
@@ -17,7 +17,11 @@ ALLOWED_SUFFIXES = (".mercadolivre.com.br", ".mercadolibre.com")
 SP_USERNAME = os.getenv("SP_USERNAME","").strip()
 SP_PASSWORD = os.getenv("SP_PASSWORD","").strip()
 _raw_eps = (os.getenv("SP_ENDPOINTS") or os.getenv("SP_ENDPOINT") or "").strip()
-ENDPOINTS = [e.strip() for e in re.split(r"[,\s]+", _raw_eps) if e.strip()]
+ENDPOINTS = [
+    re.sub(r"^https?://", "", e.strip()).rstrip("/")
+    for e in re.split(r"[,\s]+", _raw_eps)
+    if e.strip()
+]
 
 CONNECT_TO = float(os.getenv("SP_CONNECT_TIMEOUT", "3.5"))
 READ_TO    = float(os.getenv("SP_READ_TIMEOUT", "5.5"))
@@ -207,7 +211,10 @@ def pick_sticky_endpoint():
             elapsed_ms=(now-chosen.last_ts)*1000.0
             if elapsed_ms<need_gap: sleep_needed=_ms(need_gap-int(elapsed_ms))
         chosen.last_ts=max(now, now+sleep_needed); ep=chosen.endpoint
-    proxy=f"http://{SP_USERNAME}:{SP_PASSWORD}@{ep}"
+    # Escapa caracteres especiais para que usuário/senha formem uma URL válida.
+    proxy=(
+        f"http://{quote(SP_USERNAME, safe='')}:{quote(SP_PASSWORD, safe='')}@{ep}"
+    )
     return ep, {"http":proxy,"https":proxy}, sleep_needed
 
 def redirect_chain(r):
@@ -223,10 +230,22 @@ def redirect_chain(r):
 def _opts(raw): return add_cors(Response(status=204))
 
 @app.route("/_health", methods=["GET"])
-def _health(): return "ok", 200
+def _health():
+    return jsonify({
+        "ok": True,
+        "service": "nvai-proxy",
+        "decodo_configured": bool(SP_USERNAME and SP_PASSWORD and ENDPOINTS),
+        "endpoint_count": len(ENDPOINTS),
+    }), 200
 
 @app.route("/_proxy_check", methods=["GET"])
 def _proxy_check():
+    if not (SP_USERNAME and SP_PASSWORD and ENDPOINTS):
+        return jsonify({
+            "ok": False,
+            "error": "decodo_not_configured",
+            "required_variables": ["SP_USERNAME", "SP_PASSWORD", "SP_ENDPOINTS"],
+        }), 503
     try:
         ep, proxies, extra_sleep = pick_sticky_endpoint()
         if extra_sleep: time.sleep(extra_sleep)
