@@ -124,16 +124,25 @@ def add_cors(resp: Response):
     resp.headers["Vary"] = "Origin, Access-Control-Request-Headers, Access-Control-Request-Method"
     return resp
 
+def challenge_reason(resp) -> str|None:
+    url = (getattr(resp, "url", "") or "").lower()
+    markers = ("account-verification", "/security/bot_challenge")
+    for marker in markers:
+        if marker in url:
+            return marker.rsplit("/", 1)[-1]
+    content_type = resp.headers.get("content-type", "").lower()
+    if "text/html" in content_type or "application/xhtml+xml" in content_type:
+        # Requests já descomprime o corpo, inclusive Brotli com a dependência instalada.
+        body = (resp.content or b"").lower()
+        for marker in markers:
+            if marker.encode("ascii") in body:
+                return marker.rsplit("/", 1)[-1]
+    return None
+
+
 def looks_like_gate(resp) -> bool:
     try:
-        url = getattr(resp,"url","") or ""
-        if "account-verification" in url: return True
-        if resp.status_code in (403,429): return True
-        ct = resp.headers.get("content-type","")
-        if "text/html" in ct:
-            body = (resp.content or b"")[:40000].lower()
-            if b"account-verification" in body:
-                return True
+        return resp.status_code in (403, 429) or challenge_reason(resp) is not None
     except Exception:
         pass
     return False
@@ -333,6 +342,21 @@ def proxy(raw: str):
             except Exception as e:
                 actions.append(f"retry-5xx-error:{str(e)[:30]}")
 
+    # Um desafio pode vir com HTTP 200; não o entregue como HTML do anúncio.
+    reason = challenge_reason(r)
+    if reason:
+        resp = jsonify({
+            "error": "upstream_challenge",
+            "reason": reason,
+            "upstream_status": r.status_code,
+            "message": "O Mercado Livre retornou uma página de verificação, não os dados do anúncio.",
+        })
+        resp.status_code = 502
+        resp.headers["Cache-Control"] = "no-store"
+        resp.headers["X-Proxy-Error"] = "upstream_challenge"
+        resp.headers["X-Proxy-Final-Url"] = getattr(r, "url", target)
+        return add_cors(resp)
+
     # ===== CANONIZAÇÃO =====
     if SP_CANONICALIZE_ITEM:
         final_url = getattr(r,"url","") or ""
@@ -393,6 +417,9 @@ def proxy(raw: str):
     for k,v in r.headers.items():
         lk=k.lower()
         if lk in hop_by_hop: continue
+        # r.content já está descomprimido. HEAD/304 apenas descrevem a representação.
+        if lk == "content-encoding" and request.method != "HEAD" and r.status_code != 304:
+            continue
         if lk in ("content-type","cache-control","etag","last-modified","content-encoding","content-range","accept-ranges","location","vary"):
             resp.headers[k]=v
 
